@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Build Log — generates stats-light.svg / stats-dark.svg for the GitHub profile
-README, by pulling commit history for AUTHOR_EMAIL across the repos in REPOS
-via the GitHub REST API.
+README: a GitHub-native-styled contribution heatmap + repo cards, built from
+commit history for AUTHOR_EMAIL across the repos in REPOS, pulled via the
+GitHub REST API.
 
 Run by .github/workflows/update-build-log.yml on a daily cron. Requires a
 STATS_TOKEN env var: a GitHub PAT with read access to every repo in REPOS
@@ -17,32 +18,47 @@ import requests
 
 AUTHOR_EMAIL = "tushar.pimple@alumni.ie.edu"
 
-# (owner, repo, display name, color key into COLORS)
+# (owner, repo, display name, primary language — drives the GitHub-style language dot)
 REPOS = [
-    ("GainrsAI", "gainrs-core-app", "gainrs-core-app", "accent"),
-    ("GainrsAI", "dashabord.gainrs.ai", "dashabord.gainrs.ai", "teal"),
-    ("tusharpimpleie", "research_ideas_trader", "research_ideas_trader", "plum"),
-    ("tusharpimpleie", "historical_data", "historical_data", "sand"),
+    ("GainrsAI", "gainrs-core-app", "gainrs-core-app", "Python"),
+    ("GainrsAI", "dashabord.gainrs.ai", "dashabord.gainrs.ai", "TypeScript"),
+    ("tusharpimpleie", "research_ideas_trader", "research_ideas_trader", "Python"),
+    ("tusharpimpleie", "historical_data", "historical_data", "Python"),
 ]
 
-COLORS = {
+# GitHub's actual language-dot colors (github-linguist).
+LANG_COLORS = {"Python": "#3572A5", "TypeScript": "#3178c6"}
+
+# GitHub Primer design tokens — matched to the real profile page so this
+# blends into the surrounding chrome instead of reading as a separate widget.
+PRIMER = {
     "light": {
-        "accent": "#A65A25", "teal": "#2F6B5F", "plum": "#6D4160", "sand": "#8C733A",
-        "paper": "#EDF0EA", "ink": "#1A1F1B", "ink_dim": "#5B615C", "line": "#C7CCC1",
+        "canvas": "#ffffff",
+        "border": "#d0d7de",
+        "fg": "#1f2328",
+        "fg_muted": "#656d76",
+        "link": "#0969da",
+        "card_bg": "#f6f8fa",
+        "green": ["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"],
     },
     "dark": {
-        "accent": "#E0964F", "teal": "#62B39F", "plum": "#C083AE", "sand": "#CBAE66",
-        "paper": "#14181A", "ink": "#E9ECE4", "ink_dim": "#9BA39C", "line": "#2B3234",
+        "canvas": "#0d1117",
+        "border": "#30363d",
+        "fg": "#e6edf3",
+        "fg_muted": "#7d8590",
+        "link": "#4493f8",
+        "card_bg": "#161b22",
+        "green": ["#161b22", "#0e4429", "#006d32", "#26a641", "#39d353"],
     },
 }
 
+FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
 API = "https://api.github.com"
-MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
 
 
-def fetch_commit_months(owner, repo, token):
-    """Return a list of 'YYYY-MM' strings, one per commit by AUTHOR_EMAIL."""
-    months = []
+def fetch_commit_days(owner, repo, token):
+    """Return a list of 'YYYY-MM-DD' strings, one per commit by AUTHOR_EMAIL."""
+    days = []
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     params = {"author": AUTHOR_EMAIL, "per_page": 100, "page": 1}
     url = f"{API}/repos/{owner}/{repo}/commits"
@@ -54,22 +70,15 @@ def fetch_commit_months(owner, repo, token):
         batch = resp.json()
         if not batch:
             break
-        months.extend(c["commit"]["author"]["date"][:7] for c in batch)
+        days.extend(c["commit"]["author"]["date"][:10] for c in batch)
         if len(batch) < params["per_page"]:
             break
         params["page"] += 1
-    return months
+    return days
 
 
-def month_range(start_ym, end_ym):
-    (y, m), (ey, em) = start_ym, end_ym
-    out = []
-    while (y, m) <= (ey, em):
-        out.append(f"{y:04d}-{m:02d}")
-        m += 1
-        if m == 13:
-            m, y = 1, y + 1
-    return out
+def sunday_on_or_before(d):
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
 
 
 def collect():
@@ -78,114 +87,126 @@ def collect():
         sys.exit("STATS_TOKEN env var not set")
 
     per_repo = {}
-    seen_months = set()
-    for owner, repo, name, color_key in REPOS:
-        months = fetch_commit_months(owner, repo, token)
-        per_repo[name] = {"owner": owner, "color_key": color_key, "months": months, "total": len(months)}
-        seen_months.update(months)
+    all_days = []
+    for owner, repo, name, lang in REPOS:
+        days = fetch_commit_days(owner, repo, token)
+        per_repo[name] = {"owner": owner, "lang": lang, "total": len(days)}
+        all_days.extend(days)
 
-    if not seen_months:
+    if not all_days:
         sys.exit("No commits found for any configured repo — check STATS_TOKEN scope/org access.")
 
-    start = tuple(int(x) for x in min(seen_months).split("-"))
     today = datetime.date.today()
-    months = month_range(start, (today.year, today.month))
+    grid_start = sunday_on_or_before(today - datetime.timedelta(days=364))
 
-    monthly = {name: {mo: 0 for mo in months} for name in per_repo}
-    for name, info in per_repo.items():
-        for mo in info["months"]:
-            if mo in monthly[name]:
-                monthly[name][mo] += 1
+    day_counts = {}
+    for d in all_days:
+        day = datetime.date.fromisoformat(d)
+        if grid_start <= day <= today:
+            day_counts[d] = day_counts.get(d, 0) + 1
 
-    return per_repo, monthly, months
+    return per_repo, day_counts, grid_start, today
 
 
 def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def render_svg(per_repo, monthly, months, theme):
-    c = COLORS[theme]
-    W, H = 820, 480
-    pad = 40
-    total = sum(info["total"] for info in per_repo.values())
+def level(count, max_count):
+    if count == 0:
+        return 0
+    if max_count <= 1:
+        return 4
+    frac = count / max_count
+    return 1 if frac <= 0.25 else 2 if frac <= 0.5 else 3 if frac <= 0.75 else 4
+
+
+def render_svg(per_repo, day_counts, grid_start, today, theme):
+    p = PRIMER[theme]
+    total_year = sum(day_counts.values())
     n_repos = len(per_repo)
-    today_str = datetime.date.today().strftime("%d %b %Y")
+    max_day = max(day_counts.values(), default=0)
 
-    chart_x, chart_y, chart_w, chart_h = pad, 190, W - pad * 2, 130
-    n = len(months)
-    col_w = chart_w / n
-    gap = 6
-    bar_w = col_w - gap
-    max_total = max((sum(monthly[name][mo] for name in monthly) for mo in months), default=1) or 1
+    cell, gap = 10, 3
+    step = cell + gap
+    cols = (today - grid_start).days // 7 + 1
+    left_label_w = 28
+    pad = 20
+    heat_w = cols * step - gap
+    W = max(pad * 2 + left_label_w + heat_w, 760)
 
-    bars, labels = [], []
-    for i, mo in enumerate(months):
-        x = chart_x + i * col_w + gap / 2
-        y_cursor = chart_y + chart_h
-        month_total = 0
-        for name, info in per_repo.items():
-            v = monthly[name][mo]
-            month_total += v
-            if v == 0:
-                continue
-            h = (v / max_total) * chart_h
-            y_cursor -= h
-            bars.append(
-                f'<rect x="{x:.1f}" y="{y_cursor:.1f}" width="{bar_w:.1f}" height="{h:.1f}" '
-                f'fill="{c[info["color_key"]]}" />'
+    head_y, sub_y, month_y, heat_top = 30, 50, 74, 84
+    heat_h = 7 * step - gap
+    legend_y = heat_top + heat_h + 26
+    cards_top = legend_y + 22
+    card_h = 62
+    card_gap = 10
+    card_w = (W - pad * 2 - card_gap * (n_repos - 1)) / n_repos
+    H = cards_top + card_h + pad
+
+    squares = []
+    for offset in range((today - grid_start).days + 1):
+        day = grid_start + datetime.timedelta(days=offset)
+        col, row = offset // 7, (day.weekday() + 1) % 7
+        cnt = day_counts.get(day.isoformat(), 0)
+        x, y = pad + left_label_w + col * step, heat_top + row * step
+        squares.append(
+            f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" rx="2" '
+            f'fill="{p["green"][level(cnt, max_day)]}"><title>{cnt} commits on {day.isoformat()}</title></rect>'
+        )
+
+    day_labels = [
+        f'<text x="{pad}" y="{heat_top + row * step + cell}" font-size="9" fill="{p["fg_muted"]}">{lbl}</text>'
+        for row, lbl in ((1, "Mon"), (3, "Wed"), (5, "Fri"))
+    ]
+
+    month_labels, last_month = [], None
+    for col in range(cols):
+        day = grid_start + datetime.timedelta(days=col * 7)
+        if day.month != last_month:
+            x = pad + left_label_w + col * step
+            month_labels.append(
+                f'<text x="{x}" y="{month_y}" font-size="9" fill="{p["fg_muted"]}">{calendar.month_abbr[day.month]}</text>'
             )
-        month_label = calendar.month_abbr[int(mo.split("-")[1])]
-        if mo == months[-1]:
-            month_label += "*"
-        labels.append(
-            f'<text x="{x + bar_w / 2:.1f}" y="{chart_y + chart_h + 18}" font-family="{MONO}" '
-            f'font-size="10" fill="{c["ink_dim"]}" text-anchor="middle">{esc(month_label)}</text>'
-        )
-        labels.append(
-            f'<text x="{x + bar_w / 2:.1f}" y="{chart_y + chart_h + 32}" font-family="{MONO}" '
-            f'font-size="9" font-weight="600" fill="{c["ink"]}" text-anchor="middle">{month_total}</text>'
-        )
+            last_month = day.month
 
-    legend, lx, ly = [], pad, 440
+    legend_w = 5 * (cell + 4) + 70
+    lx = W - pad - legend_w
+    legend = [f'<text x="{lx}" y="{legend_y + cell}" font-size="9" fill="{p["fg_muted"]}">Less</text>']
+    for i, col_color in enumerate(p["green"]):
+        legend.append(f'<rect x="{lx + 30 + i * (cell + 4)}" y="{legend_y}" width="{cell}" height="{cell}" rx="2" fill="{col_color}" />')
+    legend.append(f'<text x="{lx + 30 + 5 * (cell + 4) + 6}" y="{legend_y + cell}" font-size="9" fill="{p["fg_muted"]}">More</text>')
+
+    cards, x = [], pad
     for name, info in per_repo.items():
-        legend.append(f'<rect x="{lx}" y="{ly - 9}" width="9" height="9" fill="{c[info["color_key"]]}" />')
-        legend.append(
-            f'<text x="{lx + 14}" y="{ly}" font-family="{MONO}" font-size="11" fill="{c["ink_dim"]}">'
-            f'{esc(name)} <tspan font-weight="700" fill="{c["ink"]}">{info["total"]}</tspan></text>'
-        )
-        lx += 30 + len(name) * 6.4 + len(str(info["total"])) * 7
+        lang = info["lang"]
+        cards.append(f'<rect x="{x:.1f}" y="{cards_top}" width="{card_w:.1f}" height="{card_h}" rx="6" fill="{p["card_bg"]}" stroke="{p["border"]}" />')
+        cards.append(f'<text x="{x + 12:.1f}" y="{cards_top + 24}" font-size="13" font-weight="600" fill="{p["link"]}">{esc(name)}</text>')
+        cards.append(f'<circle cx="{x + 16:.1f}" cy="{cards_top + 44}" r="4" fill="{LANG_COLORS.get(lang, "#8b949e")}" />')
+        cards.append(f'<text x="{x + 26:.1f}" y="{cards_top + 47}" font-size="11" fill="{p["fg_muted"]}">{esc(lang)}</text>')
+        cards.append(f'<text x="{x + card_w - 12:.1f}" y="{cards_top + 47}" font-size="11" fill="{p["fg_muted"]}" text-anchor="end">{info["total"]} commits</text>')
+        x += card_w + card_gap
 
     return f'''<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg"
-     role="img" aria-label="Build log: {total} commits across {n_repos} repos">
-  <rect width="{W}" height="{H}" fill="{c["paper"]}" />
-  <text x="{pad}" y="52" font-family="{MONO}" font-size="11" letter-spacing="2" fill="{c["ink_dim"]}">
-    BUILD LOG &#8212; GIT HISTORY, NOT A R&#201;SUM&#201;
-  </text>
-  <text x="{pad}" y="98" font-family="{MONO}" font-size="34" font-weight="700" fill="{c["ink"]}">
-    <tspan fill="{c["accent"]}">{total}</tspan> commits across <tspan fill="{c["accent"]}">{n_repos}</tspan> repos
-  </text>
-  <text x="{pad}" y="128" font-family="{MONO}" font-size="12" fill="{c["ink_dim"]}">
-    tushar.pimple@alumni.ie.edu &#183; updated {esc(today_str)}
-  </text>
-  <line x1="{pad}" y1="150" x2="{W - pad}" y2="150" stroke="{c["line"]}" stroke-width="1" />
-  {''.join(bars)}
-  {''.join(labels)}
-  <text x="{pad}" y="{chart_y + chart_h + 50}" font-family="{MONO}" font-size="9" fill="{c["ink_dim"]}">
-    *current month, partial
-  </text>
-  <line x1="{pad}" y1="410" x2="{W - pad}" y2="410" stroke="{c["line"]}" stroke-width="1" />
+     font-family="{FONT}" role="img" aria-label="{total_year} contributions in the last year across {n_repos} repositories">
+  <rect width="{W}" height="{H}" fill="{p["canvas"]}" />
+  <text x="{pad}" y="{head_y}" font-size="16" font-weight="600" fill="{p["fg"]}">{total_year} contributions in the last year</text>
+  <text x="{pad}" y="{sub_y}" font-size="12" fill="{p["fg_muted"]}">Across {n_repos} repositories, including private org work not reflected above</text>
+  {''.join(month_labels)}
+  {''.join(day_labels)}
+  {''.join(squares)}
   {''.join(legend)}
+  {''.join(cards)}
 </svg>'''
 
 
 def main():
-    per_repo, monthly, months = collect()
+    per_repo, day_counts, grid_start, today = collect()
     for theme in ("light", "dark"):
         with open(f"stats-{theme}.svg", "w") as f:
-            f.write(render_svg(per_repo, monthly, months, theme))
-    total = sum(i["total"] for i in per_repo.values())
-    print(f"Wrote stats-light.svg and stats-dark.svg — {total} total commits across {len(per_repo)} repos.")
+            f.write(render_svg(per_repo, day_counts, grid_start, today, theme))
+    total = sum(v for v in day_counts.values())
+    print(f"Wrote stats-light.svg and stats-dark.svg — {total} contributions in the last year across {len(per_repo)} repos.")
 
 
 if __name__ == "__main__":
